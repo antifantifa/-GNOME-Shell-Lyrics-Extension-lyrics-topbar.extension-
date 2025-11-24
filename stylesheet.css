@@ -1,0 +1,39 @@
+.lyrics-label {
+    font-size: 11pt;
+    padding: 0 8px;
+}
+
+.lyrics-title {
+    font-weight: bold;
+    font-size: 11pt;
+}
+
+.popup-menu-item {
+    padding: 6px 12px;
+}
+
+.lyrics-tabs {
+    spacing: 0;
+}
+
+.lyrics-tab-button {
+    background-color: #2e2e2e;
+    color: #ccc;
+    border: none;
+    padding: 8px 16px;
+    transition: background-color 200ms;
+}
+
+.lyrics-tab-button:hover {
+    background-color: #3a3a3a;
+}
+
+.lyrics-tab-button.active {
+    background-color: #4a90d9;
+    color: white;
+    font-weight: bold;
+}
+
+.lyrics-tab-container {
+    padding: 0;
+}
