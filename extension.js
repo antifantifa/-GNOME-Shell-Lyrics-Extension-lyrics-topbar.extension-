@@ -1,6 +1,7 @@
-// extension.js - GNOME Shell Lyrics Extension
+// extension.js - GNOME Shell Lyrics Extension (Debounced & Stable)
 const { GObject, St, Clutter, Gio, GLib } = imports.gi;
-// Force Soup 2.4 for compatibility
+
+// Force Soup 2.4
 imports.gi.versions.Soup = '2.4';
 const Soup = imports.gi.Soup;
 
@@ -8,7 +9,7 @@ const Main = imports.ui.main;
 const PanelMenu = imports.ui.panelMenu;
 const PopupMenu = imports.ui.popupMenu;
 const ExtensionUtils = imports.misc.extensionUtils;
-const Util = imports.misc.util; // For scroll handling
+const Util = imports.misc.util;
 
 const LyricsIndicator = GObject.registerClass(
 class LyricsIndicator extends PanelMenu.Button {
@@ -17,7 +18,6 @@ class LyricsIndicator extends PanelMenu.Button {
 
         this._settings = ExtensionUtils.getSettings('org.gnome.shell.extensions.lyrics');
 
-        // Top Bar Label
         this._label = new St.Label({
             text: '♪ Ready',
             y_align: Clutter.ActorAlign.CENTER,
@@ -25,54 +25,43 @@ class LyricsIndicator extends PanelMenu.Button {
         });
         this.add_child(this._label);
 
-        // State
-        this._currentLyrics = [];
-        this._lyricActors = []; // Stores the actual St.Label objects
-        this._currentSong = null;
+        // --- State Variables ---
+        this._currentLyrics = []; 
+        this._lyricActors = [];
+        this._currentSong = null;     
         this._currentPlayer = null;
-        this._updateInterval = null;
+        this._activeLineIndex = -1;
+
+        // Timers & IDs
+        this._updateInterval = null; 
         this._rainbowInterval = null;
-        this._hue = 0;
+        this._debounceTimeout = null; // CRITICAL: Prevents double-fetching
         this._fetchId = 0;
+        this._hue = 0;
+        
         this._session = new Soup.Session();
 
-        // --- Build UI Layout ---
-        // 1. Tabs (Top)
+        // --- UI Setup ---
         this._createTabs();
-
-        // 2. Info Header (Song Title/Artist)
         this._createHeader();
-
-        // 3. Scrollable Area (The Lyrics)
         this._createScrollArea();
-
-        // 4. Footer (Buttons)
         this._createFooter();
-
-        // 5. Artist Info Section (Hidden by default, swaps with ScrollArea)
         this._createArtistSection();
 
-        // Settings Watchers
+        // --- Watchers ---
         this._settings.connect('changed::color-animation', () => this._checkRainbowMode());
         this._settings.connect('changed::animation-speed', () => this._checkRainbowMode());
         this._settings.connect('changed::font', () => this._updateFont());
+        
         this._updateFont();
         this._checkRainbowMode();
-
         this._startMonitoring();
     }
 
-    // --- UI CREATION ---
-
     _createTabs() {
         this._tabBox = new St.BoxLayout({ style_class: 'lyrics-tabs', x_expand: true });
-        
-        this._lyricsTab = new St.Button({ 
-            label: 'Lyrics', style_class: 'lyrics-tab-button active', x_expand: true, can_focus: true 
-        });
-        this._artistTab = new St.Button({ 
-            label: 'Artist', style_class: 'lyrics-tab-button', x_expand: true, can_focus: true 
-        });
+        this._lyricsTab = new St.Button({ label: 'Lyrics', style_class: 'lyrics-tab-button active', x_expand: true, can_focus: true });
+        this._artistTab = new St.Button({ label: 'Artist', style_class: 'lyrics-tab-button', x_expand: true, can_focus: true });
         
         this._lyricsTab.connect('clicked', () => this._switchTab('lyrics'));
         this._artistTab.connect('clicked', () => this._switchTab('artist'));
@@ -80,87 +69,64 @@ class LyricsIndicator extends PanelMenu.Button {
         this._tabBox.add_child(this._lyricsTab);
         this._tabBox.add_child(this._artistTab);
         
-        const tabItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, style_class: 'lyrics-tab-container' });
+        const tabItem = new PopupMenu.PopupBaseMenuItem({ reactive: true, can_focus: false, style_class: 'lyrics-tab-container' });
         tabItem.actor.add_child(this._tabBox);
         this.menu.addMenuItem(tabItem);
     }
 
     _createHeader() {
-        // Container for Title and Artist
-        this._headerBox = new St.BoxLayout({ vertical: true, style_class: 'lyrics-header-box' });
-        
+        this._headerBox = new St.BoxLayout({ vertical: true, style_class: 'lyrics-header-box', x_expand: true });
         this._titleLabel = new St.Label({ text: 'No Song Playing', style_class: 'lyrics-title' });
-        this._artistLabel = new St.Label({ text: '', style_class: 'lyrics-artist' });
-
+        this._artistLabel = new St.Label({ text: '...', style_class: 'lyrics-artist' });
         this._headerBox.add_child(this._titleLabel);
         this._headerBox.add_child(this._artistLabel);
-
-        const headerItem = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+        
+        const headerItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
         headerItem.actor.add_child(this._headerBox);
         this.menu.addMenuItem(headerItem);
     }
 
     _createScrollArea() {
-        // Calculate Max Height (50% of primary monitor)
-        const monitor = Main.layoutManager.primaryMonitor;
-        const maxHeight = Math.floor(monitor.height * 0.5);
-
         this._scrollView = new St.ScrollView({
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
             style_class: 'lyrics-scrollview',
-            style: `max-height: ${maxHeight}px;` 
+            overlay_scrollbars: true
         });
 
-        this._lyricsBox = new St.BoxLayout({ vertical: true, style_class: 'lyrics-content-box' });
+        this._lyricsBox = new St.BoxLayout({ vertical: true, style_class: 'lyrics-content-box', x_expand: true });
         this._scrollView.add_actor(this._lyricsBox);
 
-        // Wrap in a menu item so it sits in the popup correctly
-        this._scrollMenuItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+        this._scrollMenuItem = new PopupMenu.PopupBaseMenuItem({ reactive: true, can_focus: false });
         this._scrollMenuItem.actor.add_child(this._scrollView);
         this.menu.addMenuItem(this._scrollMenuItem);
     }
 
     _createFooter() {
-        const footerBox = new St.BoxLayout({ style_class: 'lyrics-footer-box', x_expand: true, pack_start: true });
+        const footerBox = new St.BoxLayout({ style_class: 'lyrics-footer-box', x_expand: true });
 
-        // Helper to make buttons
-        const createBtn = (label, icon, callback) => {
+        const makeBtn = (label, icon, callback) => {
             const btn = new St.Button({ 
-                label: ` ${icon} ${label} `, 
-                style_class: 'lyrics-footer-button',
-                can_focus: true,
-                x_expand: true // Distribute evenly
+                label: ` ${icon} ${label} `, style_class: 'lyrics-footer-button',
+                can_focus: true, x_expand: true, x_align: Clutter.ActorAlign.CENTER
             });
-            btn.connect('clicked', () => {
-                this.menu.close(); // Optional: close menu on action? Maybe keep open for Refresh.
-                callback();
-            });
+            btn.connect('clicked', () => callback());
             return btn;
         };
 
-        const btnRefresh = createBtn('Refresh', '↻', () => {
-            if (this._currentSong) this._retryFetch();
-        });
-        // Don't close menu on refresh
-        btnRefresh.disconnectAll(); 
-        btnRefresh.connect('clicked', () => { if(this._currentSong) this._retryFetch(); });
-
-        const btnSearch = createBtn('Search', '🔍', () => this._showSearchDialog());
-        
-        const btnClear = createBtn('Clear', '🗑', () => {
-            this._currentLyrics = [];
-            this._lyricActors = [];
-            this._lyricsBox.destroy_all_children();
+        const btnRefresh = makeBtn('Refresh', '↻', () => { if (this._currentSong) this._forceFetch(); });
+        const btnSearch = makeBtn('Search', '🔍', () => { this.menu.close(); this._showSearchDialog(); });
+        const btnClear = makeBtn('Clear', '🗑', () => {
+            this._resetState();
             this._label.set_text('♪ Cleared');
             this._showStatusMessage('Lyrics cleared manually.');
         });
 
         footerBox.add_child(btnRefresh);
-        footerBox.add_child(btnSearch);
         footerBox.add_child(btnClear);
+        footerBox.add_child(btnSearch);
 
-        const footerItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+        const footerItem = new PopupMenu.PopupBaseMenuItem({ reactive: true, can_focus: false });
         footerItem.actor.add_child(footerBox);
         this.menu.addMenuItem(footerItem);
     }
@@ -171,7 +137,14 @@ class LyricsIndicator extends PanelMenu.Button {
         this._artistSection.actor.hide();
     }
 
-    // --- LOGIC ---
+    // --- State Management ---
+
+    _resetState() {
+        this._currentLyrics = [];
+        this._lyricActors = [];
+        this._activeLineIndex = -1; 
+        this._lyricsBox.destroy_all_children();
+    }
 
     _switchTab(tabName) {
         if (tabName === 'lyrics') {
@@ -188,22 +161,22 @@ class LyricsIndicator extends PanelMenu.Button {
         }
     }
 
-    _showStatusMessage(msg) {
-        this._lyricsBox.destroy_all_children();
-        const lbl = new St.Label({ text: msg, style_class: 'lyrics-status-msg', x_align: Clutter.ActorAlign.CENTER });
-        this._lyricsBox.add_child(lbl);
-    }
-
     _updateHeader(title, artist) {
         this._titleLabel.set_text(title || 'Unknown Title');
         this._artistLabel.set_text(artist || 'Unknown Artist');
     }
 
-    _retryFetch() {
-        if (!this._currentSong) return;
-        this._showSearchingIndicator();
-        this._fetchLyrics(this._currentSong.artist, this._currentSong.title, this._currentSong.album);
+    _showStatusMessage(msg, isError = false) {
+        this._resetState();
+        const lbl = new St.Label({ 
+            text: msg, 
+            style_class: isError ? 'lyrics-status-msg lyrics-error-msg' : 'lyrics-status-msg', 
+            x_align: Clutter.ActorAlign.CENTER, x_expand: true
+        });
+        this._lyricsBox.add_child(lbl);
     }
+
+    // --- Monitoring & Player Connection ---
 
     _startMonitoring() {
         this._dbusConnection = Gio.DBus.session;
@@ -238,7 +211,6 @@ class LyricsIndicator extends PanelMenu.Button {
     _connectToPlayer(busName) {
         if (this._currentPlayer === busName) return;
         this._currentPlayer = busName;
-        
         this._dbusConnection.signal_subscribe(
             busName, 'org.freedesktop.DBus.Properties', 'PropertiesChanged', '/org/mpris/MediaPlayer2',
             null, Gio.DBusSignalFlags.NONE,
@@ -267,60 +239,133 @@ class LyricsIndicator extends PanelMenu.Button {
         );
     }
 
+    // --- LOGIC FIX: Debouncing ---
+
     _onSongChanged(data) {
         try {
-            const artist = data['xesam:artist']?.[0] || 'Unknown';
-            const title = data['xesam:title'] || 'Unknown';
-            const album = data['xesam:album'] || '';
+            let artist = data['xesam:artist']?.[0] || 'Unknown';
+            let title = data['xesam:title'] || 'Unknown';
+            let album = data['xesam:album'] || '';
 
-            if (this._currentSong && this._currentSong.title === title && this._currentSong.artist === artist) return;
+            // 1. Normalize strings
+            artist = artist.trim();
+            title = title.trim();
 
-            // Reset
-            this._currentLyrics = [];
-            this._lyricActors = []; // Clear actor references
+            // 2. Strict Comparison: If same song, DO NOT fetch again.
+            if (this._currentSong && 
+                this._currentSong.title === title && 
+                this._currentSong.artist === artist) {
+                return;
+            }
+
+            // 3. New Song Detected
             this._currentSong = { artist, title, album };
-            
             this._updateHeader(title, artist);
-            this._showSearchingIndicator();
-            this._fetchLyrics(artist, title, album);
-        } catch (e) { }
+
+            // 4. DEBOUNCE: Wait 750ms before fetching. 
+            // If another signal comes (e.g., album art updated), this resets.
+            if (this._debounceTimeout) {
+                GLib.source_remove(this._debounceTimeout);
+            }
+
+            this._debounceTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 750, () => {
+                this._executeFetch();
+                this._debounceTimeout = null;
+                return GLib.SOURCE_REMOVE;
+            });
+
+        } catch (e) { logError(e); }
     }
 
-    _showSearchingIndicator() {
-        this._label.set_text('♪ Fetching...');
-        this._showStatusMessage('⏳ Fetching lyrics...');
+    _forceFetch() {
+        if (!this._currentSong) return;
+        if (this._debounceTimeout) GLib.source_remove(this._debounceTimeout);
+        this._executeFetch();
     }
 
-    _fetchLyrics(artist, title, album) {
+    _executeFetch() {
+        // Increment ID to invalidate any previous network requests still flying
         this._fetchId++;
         const currentRequestId = this._fetchId;
-        
+
+        const { artist, title, album } = this._currentSong;
+
+        // UI Feedback
+        this._resetState();
+        this._label.set_text('♪ Fetching...');
+        this._showStatusMessage('⏳ Fetching lyrics...');
+
+        // 1. Try Local File First
+        if (this._loadLyricsFromFile(artist, title)) {
+            return;
+        }
+
+        // 2. Network Request
         const url = `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}&album_name=${encodeURIComponent(album)}`;
         
         const msg = Soup.Message.new('GET', url);
         msg.request_headers.append('User-Agent', 'GNOME-Lyrics-Extension/1.0');
 
         this._session.queue_message(msg, (sess, res) => {
+            // CRITICAL: If fetch ID changed (new song started), ignore this result
             if (this._fetchId !== currentRequestId) return;
 
             if (res.status_code === 200 && res.response_body.data) {
-                this._parseLyrics(res.response_body.data.toString());
+                const json = res.response_body.data.toString();
+                this._saveLyricsToFile(artist, title, json);
+                this._parseLyrics(json);
             } else {
                 this._showNoLyricsFound();
             }
         });
     }
 
+    // --- File Handling ---
+
+    _saveLyricsToFile(artist, title, json) {
+        try {
+            const homeDir = GLib.get_home_dir();
+            const lyricsDir = GLib.build_filenamev([homeDir, '.lyrics']);
+            const dir = Gio.File.new_for_path(lyricsDir);
+            
+            if (!dir.query_exists(null)) dir.make_directory_with_parents(null);
+
+            const safeFilename = `${artist} - ${title}.lrc`.replace(/[<>:"/\\|?*]/g, '_');
+            const filepath = GLib.build_filenamev([lyricsDir, safeFilename]);
+            const file = Gio.File.new_for_path(filepath);
+
+            file.replace_contents_async(json, null, false, Gio.FileCreateFlags.NONE, null, null);
+        } catch(e) {}
+    }
+
+    _loadLyricsFromFile(artist, title) {
+        try {
+            const homeDir = GLib.get_home_dir();
+            const safeFilename = `${artist} - ${title}.lrc`.replace(/[<>:"/\\|?*]/g, '_');
+            const filepath = GLib.build_filenamev([homeDir, '.lyrics', safeFilename]);
+            const file = Gio.File.new_for_path(filepath);
+
+            if (file.query_exists(null)) {
+                const [success, contents] = file.load_contents(null);
+                if (success) {
+                    this._parseLyrics(contents.toString());
+                    return true;
+                }
+            }
+        } catch(e) { }
+        return false;
+    }
+
+    // --- Parsing & Display ---
+
     _parseLyrics(json) {
         try {
             const data = JSON.parse(json);
             const text = data.syncedLyrics || data.plainLyrics;
 
-            if (!text) {
-                this._showNoLyricsFound();
-                return;
-            }
+            if (!text) { this._showNoLyricsFound(); return; }
 
+            this._resetState();
             this._currentLyrics = [];
             const lines = text.split('\n');
             const timeRegex = /\[(\d+):(\d+)(?:\.(\d+))?\](.*)/;
@@ -345,40 +390,29 @@ class LyricsIndicator extends PanelMenu.Button {
             } else {
                 this._showNoLyricsFound();
             }
-
-        } catch (e) {
-            this._showNoLyricsFound();
-        }
+        } catch (e) { this._showNoLyricsFound(); }
     }
 
     _populateLyricsList() {
-        this._lyricsBox.destroy_all_children();
         this._lyricActors = [];
-
         for (const line of this._currentLyrics) {
             const lbl = new St.Label({ 
-                text: line.text, 
-                style_class: 'lyrics-line',
-                x_align: Clutter.ActorAlign.CENTER 
+                text: line.text, style_class: 'lyrics-line', x_align: Clutter.ActorAlign.CENTER, x_expand: true
             });
-            // We store the time on the actor for easy reference if needed
             lbl._time = line.time;
-            
             this._lyricsBox.add_child(lbl);
             this._lyricActors.push(lbl);
         }
     }
 
     _showNoLyricsFound() {
-        this._currentLyrics = [];
-        this._lyricActors = [];
+        this._resetState(); 
         this._label.set_text('♪ No Lyrics');
-        this._showStatusMessage('❌ No lyrics found.');
+        this._showStatusMessage('❌ No lyrics found.', true);
     }
 
     _updateCurrentLine() {
         if (!this._currentPlayer || !this._currentLyrics.length) return;
-
         this._dbusConnection.call(
             this._currentPlayer, '/org/mpris/MediaPlayer2', 'org.freedesktop.DBus.Properties', 'Get',
             new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', 'Position']),
@@ -393,47 +427,41 @@ class LyricsIndicator extends PanelMenu.Button {
     }
 
     _syncUI(positionMs) {
-        let activeIndex = -1;
+        if (this._currentLyrics.length === 0) return;
         
-        // Find active line index
+        let newIndex = -1;
         for (let i = 0; i < this._currentLyrics.length; i++) {
-            if (this._currentLyrics[i].time <= positionMs) {
-                activeIndex = i;
-            } else {
-                break;
-            }
+            if (this._currentLyrics[i].time <= positionMs) newIndex = i;
+            else break;
         }
 
-        if (activeIndex !== -1) {
-            const activeLine = this._currentLyrics[activeIndex];
-            
-            // 1. Update Top Bar Text
+        if (newIndex !== -1 && newIndex !== this._activeLineIndex) {
+            this._activeLineIndex = newIndex;
+
+            const activeLine = this._currentLyrics[newIndex];
             const maxLen = this._settings.get_int('max-line-length') || 50;
             let txt = activeLine.text;
             if (txt.length > maxLen) txt = txt.substring(0, maxLen) + '...';
             this._label.set_text(`♪ ${txt}`);
 
-            // 2. Highlight and Scroll
-            if (this._lyricActors[activeIndex]) {
-                const activeActor = this._lyricActors[activeIndex];
-
-                // Remove highlight from all
-                this._lyricActors.forEach(a => a.remove_style_class_name('lyrics-line-active'));
+            if (this._lyricActors[newIndex]) {
+                const activeActor = this._lyricActors[newIndex];
                 
-                // Add highlight to current
+                this._lyricActors.forEach(a => a.remove_style_class_name('lyrics-line-active'));
                 activeActor.add_style_class_name('lyrics-line-active');
-
-                // Auto Scroll
-                if (this._scrollView) {
-                     Util.ensureActorVisibleInScrollView(this._scrollView, activeActor);
-                }
+                
+                // Safe scroll
+                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    if (this._scrollView && activeActor && activeActor.get_parent()) {
+                        Util.ensureActorVisibleInScrollView(this._scrollView, activeActor);
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
             }
         }
     }
 
     _showSearchDialog() {
-        // ... (Keep existing search dialog logic)
-        this.menu.close();
         const artist = this._currentSong ? this._currentSong.artist : '';
         const title = this._currentSong ? this._currentSong.title : '';
         const cmd = ['zenity', '--forms', '--title=Search Lyrics', '--text=Details', '--add-entry=Artist', '--add-entry=Title', `--entry-text=${artist}|${title}`, '--separator=|||'];
@@ -448,8 +476,7 @@ class LyricsIndicator extends PanelMenu.Button {
                         if (newA && newT) {
                             this._currentSong = { artist: newA, title: newT, album: '' };
                             this._updateHeader(newT, newA);
-                            this._showSearchingIndicator();
-                            this._fetchLyrics(newA, newT, '');
+                            this._forceFetch(); // Force logic
                         }
                     }
                 } catch (e) {}
@@ -464,15 +491,14 @@ class LyricsIndicator extends PanelMenu.Button {
         
         const url = `https://musicbrainz.org/ws/2/artist/?query=artist:${encodeURIComponent(this._currentSong.artist)}&fmt=json&limit=1`;
         const msg = Soup.Message.new('GET', url);
-        msg.request_headers.append('User-Agent', 'GNOME-Lyrics-Extension/1.0 ( https://github.com/generic/lyrics-extension )');
-        msg.request_headers.append('Accept', 'application/json');
+        msg.request_headers.append('User-Agent', 'GNOME-Lyrics-Extension/1.0 ( mailto:user@localhost )');
 
         this._session.queue_message(msg, (sess, res) => {
             this._artistSection.removeAll();
             if (res.status_code === 200) {
                 try {
                     const data = JSON.parse(res.response_body.data);
-                    if (data.artists && data.artists.length > 0) {
+                    if (data.artists?.[0]) {
                         const artist = data.artists[0];
                         const name = new PopupMenu.PopupMenuItem(artist.name, {reactive:false});
                         name.label.style = 'font-weight:bold; font-size:13pt';
@@ -484,16 +510,14 @@ class LyricsIndicator extends PanelMenu.Button {
                         }
                         if (artist.tags) {
                             const tags = artist.tags.slice(0,3).map(t => t.name).join(', ');
-                            const tagItem = new PopupMenu.PopupMenuItem('Tags: ' + tags, {reactive:false});
-                            tagItem.label.style = "font-size: 9pt; color: #888;";
-                            this._artistSection.addMenuItem(tagItem);
+                            this._artistSection.addMenuItem(new PopupMenu.PopupMenuItem('Tags: ' + tags, {reactive:false}));
                         }
                     } else {
                         this._artistSection.addMenuItem(new PopupMenu.PopupMenuItem('Artist not found', {reactive:false}));
                     }
-                } catch(e) { }
+                } catch(e) {}
             } else {
-                this._artistSection.addMenuItem(new PopupMenu.PopupMenuItem('Connection failed', {reactive:false}));
+                 this._artistSection.addMenuItem(new PopupMenu.PopupMenuItem(`Error ${res.status_code}`, {reactive:false}));
             }
         });
     }
@@ -526,6 +550,7 @@ class LyricsIndicator extends PanelMenu.Button {
 
     destroy() {
         if (this._updateInterval) GLib.source_remove(this._updateInterval);
+        if (this._debounceTimeout) GLib.source_remove(this._debounceTimeout);
         if (this._rainbowInterval) GLib.source_remove(this._rainbowInterval);
         super.destroy();
     }
