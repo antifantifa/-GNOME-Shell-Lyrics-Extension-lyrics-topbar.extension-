@@ -3,13 +3,17 @@ const { GObject, St, Clutter, Gio, Soup, GLib } = imports.gi;
 const Main = imports.ui.main;
 const PanelMenu = imports.ui.panelMenu;
 const PopupMenu = imports.ui.popupMenu;
+const ExtensionUtils = imports.misc.extensionUtils;
 
 const LyricsIndicator = GObject.registerClass(
 class LyricsIndicator extends PanelMenu.Button {
     _init() {
         super._init(0.0, 'Lyrics Indicator');
 
-        // Create label for top bar
+        // 1. Load Settings
+        this._settings = ExtensionUtils.getSettings('org.gnome.shell.extensions.lyrics');
+
+        // 2. Top Bar Label
         this._label = new St.Label({
             text: '♪ Ready',
             y_align: Clutter.ActorAlign.CENTER,
@@ -17,57 +21,51 @@ class LyricsIndicator extends PanelMenu.Button {
         });
         this.add_child(this._label);
 
-        // Initialize state variables
-        this._currentLyrics = [];
+        // 3. State Variables
+        this._currentLyrics = []; // Holds the time/text data
+        this._lyricMenuItems = []; // Holds the menu item objects
         this._currentSong = null;
         this._currentPlayer = null;
-        this._updateInterval = null;
-        this._isFetching = false;
-        
-        // HTTP session
+        this._updateInterval = null; 
+        this._rainbowInterval = null;
+        this._hue = 0;
+
         this._session = new Soup.Session();
 
-        // 1. Create Tabs (Lyrics / Artist)
+        // 4. Build Menu
         this._createTabs();
-
-        // 2. Refresh Button
+        
+        // Refresh Button
         this._refreshButton = new PopupMenu.PopupMenuItem('↻ Refresh Current Song');
         this._refreshButton.connect('activate', () => {
-            if (this._currentSong) {
-                this._retryFetch();
-            }
+            if (this._currentSong) this._retryFetch();
         });
         this.menu.addMenuItem(this._refreshButton);
 
-        // 3. Search Button
+        // Manual Search Button
         this._searchButton = new PopupMenu.PopupMenuItem('🔍 Search Lyrics Manually');
-        this._searchButton.connect('activate', () => {
-            this._showSearchDialog();
-        });
+        this._searchButton.connect('activate', () => this._showSearchDialog());
         this.menu.addMenuItem(this._searchButton);
 
-        // Start background tasks
+        // 5. Watch Settings
+        this._settings.connect('changed::color-animation', () => this._checkRainbowMode());
+        this._settings.connect('changed::animation-speed', () => this._checkRainbowMode());
+        this._settings.connect('changed::font', () => this._updateFont());
+        this._updateFont();
+        this._checkRainbowMode();
+
+        // 6. Start Loop
         this._startMonitoring();
     }
 
     _createTabs() {
-        this._tabBox = new St.BoxLayout({ 
-            style_class: 'lyrics-tabs',
-            x_expand: true
-        });
+        this._tabBox = new St.BoxLayout({ style_class: 'lyrics-tabs', x_expand: true });
         
         this._lyricsTab = new St.Button({ 
-            label: 'Lyrics',
-            style_class: 'lyrics-tab-button active',
-            x_expand: true,
-            can_focus: true
+            label: 'Lyrics', style_class: 'lyrics-tab-button active', x_expand: true, can_focus: true 
         });
-        
         this._artistTab = new St.Button({ 
-            label: 'Artist Info',
-            style_class: 'lyrics-tab-button',
-            x_expand: true,
-            can_focus: true
+            label: 'Artist', style_class: 'lyrics-tab-button', x_expand: true, can_focus: true 
         });
         
         this._lyricsTab.connect('clicked', () => this._switchTab('lyrics'));
@@ -76,21 +74,14 @@ class LyricsIndicator extends PanelMenu.Button {
         this._tabBox.add_child(this._lyricsTab);
         this._tabBox.add_child(this._artistTab);
         
-        // Add tab container to menu
-        const tabItem = new PopupMenu.PopupBaseMenuItem({ 
-            reactive: false,
-            style_class: 'lyrics-tab-container'
-        });
+        const tabItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, style_class: 'lyrics-tab-container' });
         tabItem.actor.add_child(this._tabBox);
         this.menu.addMenuItem(tabItem);
         
-        // Sections
         this._lyricsSection = new PopupMenu.PopupMenuSection();
         this._artistSection = new PopupMenu.PopupMenuSection();
-        
         this.menu.addMenuItem(this._lyricsSection);
         this.menu.addMenuItem(this._artistSection);
-        
         this._artistSection.actor.hide();
     }
 
@@ -111,154 +102,121 @@ class LyricsIndicator extends PanelMenu.Button {
 
     _retryFetch() {
         if (!this._currentSong) return;
-        log(`[Lyrics] Retrying fetch for ${this._currentSong.title}`);
         this._showSearchingIndicator();
         this._fetchLyrics(this._currentSong.artist, this._currentSong.title, this._currentSong.album);
     }
 
+    // --- MAIN LOGIC ---
+
     _startMonitoring() {
         this._dbusConnection = Gio.DBus.session;
-        
-        // Update loop for synced lyrics
+        // Run check every 500ms
         this._updateInterval = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
             this._updateCurrentLine();
             return GLib.SOURCE_CONTINUE;
         });
-
         this._findMusicPlayer();
     }
 
     _findMusicPlayer() {
         this._dbusConnection.call(
-            'org.freedesktop.DBus',
-            '/org/freedesktop/DBus',
-            'org.freedesktop.DBus',
-            'ListNames',
+            'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'ListNames',
             null, null, Gio.DBusCallFlags.NONE, -1, null,
-            (connection, result) => {
+            (c, result) => {
                 try {
-                    const reply = connection.call_finish(result);
-                    const names = reply.get_child_value(0).deep_unpack();
-                    
+                    const names = c.call_finish(result).get_child_value(0).deep_unpack();
+                    // Simple auto-detection
                     const player = names.find(n => n.startsWith('org.mpris.MediaPlayer2.') && !n.includes('browser'));
-                    
-                    if (player) {
-                        this._connectToPlayer(player);
-                    } else {
-                        this._label.set_text('♪ No Player');
-                    }
-                } catch (e) {
-                    logError(e, '[Lyrics] DBus error');
-                }
+                    if (player) this._connectToPlayer(player);
+                } catch (e) { log(e); }
             }
         );
     }
 
     _connectToPlayer(busName) {
         if (this._currentPlayer === busName) return;
-        
-        log('[Lyrics] Connected to ' + busName);
         this._currentPlayer = busName;
         
         this._dbusConnection.signal_subscribe(
-            busName,
-            'org.freedesktop.DBus.Properties',
-            'PropertiesChanged',
-            '/org/mpris/MediaPlayer2',
-            null,
-            Gio.DBusSignalFlags.NONE,
+            busName, 'org.freedesktop.DBus.Properties', 'PropertiesChanged', '/org/mpris/MediaPlayer2',
+            null, Gio.DBusSignalFlags.NONE,
             (c, s, p, i, sig, params) => this._onPlayerPropertiesChanged(params)
         );
-
         this._getCurrentSong();
     }
 
     _onPlayerPropertiesChanged(params) {
         const changed = params.get_child_value(1).deep_unpack();
-        if ('Metadata' in changed) {
-            this._onSongChanged(changed['Metadata']);
-        }
+        if ('Metadata' in changed) this._onSongChanged(changed['Metadata']);
     }
 
     _getCurrentSong() {
         if (!this._currentPlayer) return;
-        
         this._dbusConnection.call(
-            this._currentPlayer,
-            '/org/mpris/MediaPlayer2',
-            'org.freedesktop.DBus.Properties',
-            'Get',
+            this._currentPlayer, '/org/mpris/MediaPlayer2', 'org.freedesktop.DBus.Properties', 'Get',
             new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', 'Metadata']),
             null, Gio.DBusCallFlags.NONE, -1, null,
             (c, res) => {
                 try {
-                    const reply = c.call_finish(res);
-                    const val = reply.get_child_value(0).get_variant();
+                    const val = c.call_finish(res).get_child_value(0).get_variant();
                     this._onSongChanged(val.deep_unpack());
-                } catch (e) { /* ignore */ }
+                } catch (e) {}
             }
         );
     }
 
     _onSongChanged(data) {
-        try {
-            const artist = data['xesam:artist']?.[0] || 'Unknown';
-            const title = data['xesam:title'] || 'Unknown';
-            const album = data['xesam:album'] || '';
+        const artist = data['xesam:artist']?.[0] || 'Unknown';
+        const title = data['xesam:title'] || 'Unknown';
+        const album = data['xesam:album'] || '';
 
-            const newSong = { artist, title, album };
+        // If it's the exact same song, do nothing
+        if (this._currentSong && this._currentSong.title === title && this._currentSong.artist === artist) return;
 
-            if (this._currentSong && 
-                this._currentSong.artist === newSong.artist && 
-                this._currentSong.title === newSong.title) {
-                return;
-            }
+        // CRITICAL: Clear old data immediately
+        this._currentLyrics = []; 
+        this._lyricMenuItems = [];
+        this._currentSong = { artist, title, album };
 
-            this._currentSong = newSong;
-            this._showSearchingIndicator();
-            this._fetchLyrics(artist, title, album);
-        } catch (e) {
-            logError(e, '[Lyrics] Song data parse error');
-        }
+        this._showSearchingIndicator();
+        this._fetchLyrics(artist, title, album);
     }
 
     _showSearchingIndicator() {
-        this._isFetching = true;
         this._label.set_text('♪ Fetching...');
         
+        // Clear menu UI
         this._lyricsSection.removeAll();
         
-        // Song Title Header
+        // Add Header
         if (this._currentSong) {
-            const header = new PopupMenu.PopupMenuItem(
-                `${this._currentSong.artist} - ${this._currentSong.title}`, 
-                { reactive: false }
-            );
+            const header = new PopupMenu.PopupMenuItem(`${this._currentSong.artist} - ${this._currentSong.title}`, { reactive: false });
             header.label.style_class = 'lyrics-title';
             this._lyricsSection.addMenuItem(header);
             this._lyricsSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         }
 
-        // Loading spinner/text
-        const loadingItem = new PopupMenu.PopupMenuItem('⏳ Fetching lyrics...', { reactive: false });
-        loadingItem.label.style_class = 'lyrics-status-msg';
-        this._lyricsSection.addMenuItem(loadingItem);
+        const item = new PopupMenu.PopupMenuItem('⏳ Fetching lyrics...', { reactive: false });
+        this._lyricsSection.addMenuItem(item);
     }
 
     _fetchLyrics(artist, title, album) {
-        // Build URL (using LRCLIB as default)
+        // Capture specific song details for the closure
+        const targetTitle = title;
+        
         const url = `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}&album_name=${encodeURIComponent(album)}`;
         
-        const message = Soup.Message.new('GET', url);
-        message.request_headers.append('User-Agent', 'GNOME-Lyrics-Extension');
+        const msg = Soup.Message.new('GET', url);
+        this._session.queue_message(msg, (sess, res) => {
+            // CRITICAL: Check if song changed while we were waiting
+            if (!this._currentSong || this._currentSong.title !== targetTitle) {
+                log('[Lyrics] Ignoring stale response for ' + targetTitle);
+                return;
+            }
 
-        this._session.queue_message(message, (session, message) => {
-            this._isFetching = false;
-            
-            if (message.status_code === 200 && message.response_body.data) {
-                this._parseLyrics(message.response_body.data.toString());
+            if (res.status_code === 200 && res.response_body.data) {
+                this._parseLyrics(res.response_body.data.toString());
             } else {
-                this._label.set_text('♪ No Lyrics');
                 this._showNoLyricsFound();
             }
         });
@@ -269,11 +227,12 @@ class LyricsIndicator extends PanelMenu.Button {
             const data = JSON.parse(json);
             const text = data.syncedLyrics || data.plainLyrics;
 
-            if (!text) throw new Error("No lyrics in JSON");
+            if (!text) {
+                this._showNoLyricsFound();
+                return;
+            }
 
             this._currentLyrics = [];
-            
-            // Parse LRC
             const lines = text.split('\n');
             const timeRegex = /\[(\d+):(\d+)(?:\.(\d+))?\](.*)/;
 
@@ -283,181 +242,173 @@ class LyricsIndicator extends PanelMenu.Button {
                     const min = parseInt(match[1]);
                     const sec = parseInt(match[2]);
                     const ms = match[3] ? parseInt(match[3].padEnd(3, '0').substring(0,3)) : 0;
-                    const content = match[4].trim();
-                    
-                    if (content) {
-                        this._currentLyrics.push({
-                            time: (min * 60 + sec) * 1000 + ms,
-                            text: content
-                        });
-                    }
+                    this._currentLyrics.push({
+                        time: (min * 60 + sec) * 1000 + ms,
+                        text: match[4].trim()
+                    });
                 }
             }
-
             this._currentLyrics.sort((a, b) => a.time - b.time);
             
             if (this._currentLyrics.length > 0) {
-                this._label.set_text('♪ Lyrics Ready');
+                this._label.set_text('♪ Ready');
                 this._updatePopupMenu();
             } else {
                 this._showNoLyricsFound();
             }
 
         } catch (e) {
-            logError(e, '[Lyrics] Parse error');
+            logError(e, '[Lyrics] Parse Error');
             this._showNoLyricsFound();
         }
     }
 
     _showNoLyricsFound() {
+        // CRITICAL: Ensure data is empty so sync loop doesn't run
+        this._currentLyrics = [];
+        this._lyricMenuItems = [];
+
+        this._label.set_text('♪ No Lyrics');
         this._lyricsSection.removeAll();
         
+        // Header
         if (this._currentSong) {
-            const header = new PopupMenu.PopupMenuItem(
-                `${this._currentSong.artist} - ${this._currentSong.title}`, 
-                { reactive: false }
-            );
+            const header = new PopupMenu.PopupMenuItem(`${this._currentSong.artist} - ${this._currentSong.title}`, { reactive: false });
             header.label.style_class = 'lyrics-title';
             this._lyricsSection.addMenuItem(header);
             this._lyricsSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         }
 
-        // Make the error message reactive (clickable)
-        const errorItem = new PopupMenu.PopupMenuItem('❌ No lyrics found. Click to Search.', { reactive: true });
-        errorItem.label.style_class = 'lyrics-error-msg lyrics-action-item';
-        
-        // Allow clicking the error message to trigger search
-        errorItem.connect('activate', () => {
+        // Clickable Error Message
+        const item = new PopupMenu.PopupMenuItem('❌ No lyrics found. Click to Search.', { reactive: true });
+        item.label.style_class = 'lyrics-error-msg';
+        item.connect('activate', () => {
             this.menu.close();
             this._showSearchDialog();
         });
-        
-        this._lyricsSection.addMenuItem(errorItem);
-        this._label.set_text('♪ No Lyrics');
+        this._lyricsSection.addMenuItem(item);
     }
 
     _updatePopupMenu() {
         this._lyricsSection.removeAll();
-        
-        // Header
-        const header = new PopupMenu.PopupMenuItem(
-            `${this._currentSong.artist} - ${this._currentSong.title}`, 
-            { reactive: false }
-        );
+        // Title Header
+        const header = new PopupMenu.PopupMenuItem(`${this._currentSong.artist} - ${this._currentSong.title}`, { reactive: false });
         header.label.style_class = 'lyrics-title';
         this._lyricsSection.addMenuItem(header);
         this._lyricsSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        // Lyrics Lines
         this._lyricMenuItems = [];
         for (const line of this._currentLyrics) {
             const item = new PopupMenu.PopupMenuItem(line.text, { reactive: false });
             item.label.style_class = 'lyrics-content-item';
-            item._time = line.time; // Store time for syncing
+            item._time = line.time;
             this._lyricsSection.addMenuItem(item);
             this._lyricMenuItems.push(item);
         }
     }
 
     _updateCurrentLine() {
+        // If we have no lyrics, do absolutely nothing
         if (!this._currentPlayer || !this._currentLyrics.length) return;
 
         this._dbusConnection.call(
-            this._currentPlayer,
-            '/org/mpris/MediaPlayer2',
-            'org.freedesktop.DBus.Properties',
-            'Get',
+            this._currentPlayer, '/org/mpris/MediaPlayer2', 'org.freedesktop.DBus.Properties', 'Get',
             new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', 'Position']),
             null, Gio.DBusCallFlags.NONE, -1, null,
             (c, res) => {
                 try {
-                    const reply = c.call_finish(res);
-                    const pos = reply.get_child_value(0).get_variant().get_int64() / 1000; // to ms
+                    const pos = c.call_finish(res).get_child_value(0).get_variant().get_int64() / 1000;
                     this._syncUI(pos);
-                } catch (e) { /* ignore */ }
+                } catch (e) {}
             }
         );
     }
 
     _syncUI(positionMs) {
         let activeLine = null;
-        
-        // Find current line
         for (let i = 0; i < this._currentLyrics.length; i++) {
-            if (this._currentLyrics[i].time <= positionMs) {
-                activeLine = this._currentLyrics[i];
-            } else {
-                break;
-            }
+            if (this._currentLyrics[i].time <= positionMs) activeLine = this._currentLyrics[i];
+            else break;
         }
 
         if (activeLine) {
-            // Update Top Bar
-            const maxLen = 40;
+            // Top Bar
+            const maxLen = this._settings.get_int('max-line-length') || 50;
             let txt = activeLine.text;
             if (txt.length > maxLen) txt = txt.substring(0, maxLen) + '...';
             this._label.set_text(`♪ ${txt}`);
 
-            // Update Popup Menu Highlighting
+            // Dropdown Menu Highlight
             if (this._lyricMenuItems) {
-                for (const item of this._lyricMenuItems) {
-                    if (item._time === activeLine.time) {
-                        item.label.style_class = 'lyrics-content-item lyrics-current-line';
-                    } else {
-                        item.label.style_class = 'lyrics-content-item';
-                    }
-                }
+                this._lyricMenuItems.forEach(item => {
+                    if (item._time === activeLine.time) item.label.style_class = 'lyrics-content-item lyrics-current-line';
+                    else item.label.style_class = 'lyrics-content-item';
+                });
             }
         }
     }
 
-    _showSearchDialog() {
-        // Close the menu first to prevent locking
-        this.menu.close();
+    // --- UTILITIES ---
 
+    _showSearchDialog() {
+        this.menu.close();
         const artist = this._currentSong ? this._currentSong.artist : '';
         const title = this._currentSong ? this._currentSong.title : '';
         
-        const cmd = [
-            'zenity', '--forms', 
-            '--title=Search Lyrics', 
-            '--text=Enter Song Details', 
-            '--add-entry=Artist', 
-            '--add-entry=Title', 
-            `--entry-text=${artist}|${title}`,
-            '--separator=|||'
-        ];
-
+        const cmd = ['zenity', '--forms', '--title=Search Lyrics', '--text=Details', '--add-entry=Artist', '--add-entry=Title', `--entry-text=${artist}|${title}`, '--separator=|||'];
+        
         try {
             let proc = Gio.Subprocess.new(cmd, Gio.SubprocessFlags.STDOUT_PIPE);
             proc.communicate_utf8_async(null, null, (proc, res) => {
                 try {
-                    const [, stdout] = proc.communicate_utf8_finish(res);
-                    if (proc.get_successful() && stdout) {
-                        const [newArtist, newTitle] = stdout.trim().split('|||');
-                        if (newArtist && newTitle) {
-                            this._currentSong = { artist: newArtist, title: newTitle, album: '' };
+                    const [, out] = proc.communicate_utf8_finish(res);
+                    if (out) {
+                        const [newA, newT] = out.trim().split('|||');
+                        if (newA && newT) {
+                            // Ensure clean state before manual search
+                            this._currentLyrics = [];
+                            this._currentSong = { artist: newA, title: newT, album: '' };
                             this._showSearchingIndicator();
-                            this._fetchLyrics(newArtist, newTitle, '');
+                            this._fetchLyrics(newA, newT, '');
                         }
                     }
-                } catch (e) { logError(e); }
+                } catch (e) {}
             });
-        } catch (e) { logError(e); }
+        } catch (e) {}
+    }
+
+    _updateFont() {
+        const font = this._settings.get_string('font');
+        if (!this._rainbowInterval) this._label.style = `font: ${font};`;
+    }
+
+    _checkRainbowMode() {
+        const isEnabled = this._settings.get_boolean('color-animation');
+        if (this._rainbowInterval) {
+            GLib.source_remove(this._rainbowInterval);
+            this._rainbowInterval = null;
+        }
+
+        if (isEnabled) {
+            const speed = this._settings.get_double('animation-speed') || 1.0;
+            const interval = Math.max(20, Math.floor(100 / speed));
+            this._rainbowInterval = GLib.timeout_add(GLib.PRIORITY_DEFAULT, interval, () => {
+                this._hue = (this._hue + 5) % 360;
+                const font = this._settings.get_string('font');
+                this._label.style = `font: ${font}; color: hsl(${this._hue}, 100%, 70%);`;
+                return GLib.SOURCE_CONTINUE;
+            });
+        } else {
+            this._updateFont();
+        }
     }
 
     _fetchArtistInfo() {
-        // Simplified Artist Info Fetcher
-        if (!this._currentSong) {
-            this._showArtistStatus('No song playing');
-            return;
-        }
-
+        if (!this._currentSong) return;
         this._artistSection.removeAll();
-        this._showArtistStatus('Fetching artist info...');
-
-        const url = `https://musicbrainz.org/ws/2/artist/?query=${encodeURIComponent(this._currentSong.artist)}&fmt=json&limit=1`;
+        this._artistSection.addMenuItem(new PopupMenu.PopupMenuItem('Fetching info...', {reactive:false}));
         
+        const url = `https://musicbrainz.org/ws/2/artist/?query=${encodeURIComponent(this._currentSong.artist)}&fmt=json&limit=1`;
         const msg = Soup.Message.new('GET', url);
         msg.request_headers.append('User-Agent', 'GNOME-Lyrics-Extension/1.0');
 
@@ -466,48 +417,43 @@ class LyricsIndicator extends PanelMenu.Button {
             if (res.status_code === 200) {
                 try {
                     const data = JSON.parse(res.response_body.data);
-                    if (data.artists && data.artists.length > 0) {
+                    if (data.artists?.[0]) {
                         const artist = data.artists[0];
+                        const name = new PopupMenu.PopupMenuItem(artist.name, {reactive:false});
+                        name.label.style = 'font-weight:bold; font-size:13pt';
+                        this._artistSection.addMenuItem(name);
                         
-                        const nameItem = new PopupMenu.PopupMenuItem(artist.name, { reactive: false });
-                        nameItem.label.style = 'font-weight: bold; font-size: 13pt;';
-                        this._artistSection.addMenuItem(nameItem);
-
-                        if (artist.country || artist.type) {
-                            const details = [artist.type, artist.country].filter(x=>x).join(' • ');
-                            this._artistSection.addMenuItem(new PopupMenu.PopupMenuItem(details, { reactive: false }));
-                        }
-                        
-                        if (artist.tags) {
-                            const tags = artist.tags.slice(0, 3).map(t => t.name).join(', ');
-                            const tagItem = new PopupMenu.PopupMenuItem(`Genre: ${tags}`, { reactive: false });
-                            tagItem.label.style = 'font-size: 9pt; color: #aaa;';
-                            this._artistSection.addMenuItem(tagItem);
+                        if (artist.type || artist.country) {
+                            this._artistSection.addMenuItem(new PopupMenu.PopupMenuItem([artist.type, artist.country].filter(x=>x).join(' • '), {reactive:false}));
                         }
                     } else {
-                        this._showArtistStatus('Artist not found');
+                        this._artistSection.addMenuItem(new PopupMenu.PopupMenuItem('Artist not found', {reactive:false}));
                     }
-                } catch (e) { this._showArtistStatus('Parse error'); }
-            } else {
-                this._showArtistStatus('Network error');
+                } catch(e) {}
             }
         });
     }
 
-    _showArtistStatus(msg) {
-        const item = new PopupMenu.PopupMenuItem(msg, { reactive: false });
-        item.label.style = 'color: #888; font-style: italic;';
-        this._artistSection.addMenuItem(item);
-    }
-
     destroy() {
-        if (this._updateInterval) {
-            GLib.source_remove(this._updateInterval);
-        }
+        if (this._updateInterval) GLib.source_remove(this._updateInterval);
+        if (this._rainbowInterval) GLib.source_remove(this._rainbowInterval);
         super.destroy();
     }
 });
 
 class Extension {
     enable() {
-        this._indicat
+        this._indicator = new LyricsIndicator();
+        Main.panel.addToStatusArea('lyrics-indicator', this._indicator);
+    }
+    disable() {
+        if (this._indicator) {
+            this._indicator.destroy();
+            this._indicator = null;
+        }
+    }
+}
+
+function init() {
+    return new Extension();
+}
