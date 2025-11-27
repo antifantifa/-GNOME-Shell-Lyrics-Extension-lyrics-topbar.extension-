@@ -32,8 +32,9 @@ class LyricsIndicator extends PanelMenu.Button {
         this._currentPlayer = null;
         this._activeLineIndex = -1;
         this._updateInterval = null;
+        this._fetchTimeoutId = null;
         this._dbusSignalId = null;
-        this._hue = 0;
+        this._playbackStatus = 'Stopped';
 
         // HTTP session
         this._session = new Soup.Session();
@@ -216,22 +217,12 @@ class LyricsIndicator extends PanelMenu.Button {
         this._artistLabel.set_text(artist || 'Unknown Artist');
     }
 
-    _showStatusMessage(msg, isError = false) {
-        this._resetState();
-        const lbl = new St.Label({ 
-            text: msg,
-            style: `font-style: italic; color: ${isError ? '#ff6b6b' : '#888'}; text-align: center; padding: 20px;`,
-            x_align: Clutter.ActorAlign.CENTER,
-            x_expand: true
-        });
-        this._lyricsBox.add_child(lbl);
-    }
-
     _safeString(val) {
         if (val === null || val === undefined) return "";
+        // If it's a Variant, unpack it
+        if (val.deep_unpack) return this._safeString(val.deep_unpack());
         if (typeof val === 'string') return val;
         if (Array.isArray(val)) return val.length > 0 ? this._safeString(val[0]) : "";
-        if (val.deep_unpack) return this._safeString(val.deep_unpack());
         return String(val);
     }
 
@@ -323,25 +314,56 @@ class LyricsIndicator extends PanelMenu.Button {
             }
         );
         
-        this._getCurrentSong();
+        // Use GetAll to fetch everything atomically on connection
+        this._refreshPlayerState();
     }
 
     _onPlayerPropertiesChanged(params) {
-        const changed = params.get_child_value(1).deep_unpack();
+        const changedDict = params.get_child_value(1);
+        const changed = changedDict.deep_unpack();
+        
+        // Update playback status if changed
+        if ('PlaybackStatus' in changed) {
+            let status = changed['PlaybackStatus'];
+            
+            // Explicitly unpack if it's still a Variant
+            if (status && status.deep_unpack) {
+                status = status.deep_unpack();
+            }
+            
+            this._playbackStatus = status;
+            log(`[Lyrics] Playback status changed: ${this._playbackStatus}`);
+            
+            // If stopped, clear current song
+            if (this._playbackStatus === 'Stopped') {
+                this._resetState();
+                this._currentSong = null;
+                this._label.set_text('♪ Idle');
+                this._updateHeader('No Song Playing', '...');
+                return;
+            }
+        }
+        
+        // Handle metadata changes
         if ('Metadata' in changed) {
-            this._onSongChanged(changed['Metadata']);
+            let meta = changed['Metadata'];
+            // Unpack metadata if needed
+            if (meta && meta.deep_unpack) {
+                meta = meta.deep_unpack();
+            }
+            this._onSongChanged(meta);
         }
     }
 
-    _getCurrentSong() {
+    _refreshPlayerState() {
         if (!this._currentPlayer) return;
         
         this._dbusConnection.call(
             this._currentPlayer,
             '/org/mpris/MediaPlayer2',
             'org.freedesktop.DBus.Properties',
-            'Get',
-            new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', 'Metadata']),
+            'GetAll',
+            new GLib.Variant('(s)', ['org.mpris.MediaPlayer2.Player']),
             null,
             Gio.DBusCallFlags.NONE,
             -1,
@@ -349,11 +371,22 @@ class LyricsIndicator extends PanelMenu.Button {
             (connection, result) => {
                 try {
                     const reply = connection.call_finish(result);
-                    const variant = reply.get_child_value(0).get_variant();
-                    const data = variant.deep_unpack();
-                    this._onSongChanged(data);
+                    const props = reply.get_child_value(0).deep_unpack();
+                    
+                    if ('PlaybackStatus' in props) {
+                        let status = props['PlaybackStatus'];
+                        if (status && status.deep_unpack) status = status.deep_unpack();
+                        this._playbackStatus = status;
+                        log(`[Lyrics] Initial Status: ${this._playbackStatus}`);
+                    }
+                    
+                    if ('Metadata' in props) {
+                        let meta = props['Metadata'];
+                        if (meta && meta.deep_unpack) meta = meta.deep_unpack();
+                        this._onSongChanged(meta);
+                    }
                 } catch (e) {
-                    logError(e, '[Lyrics] Failed to get current song');
+                    logError(e, '[Lyrics] Failed to refresh player state');
                 }
             }
         );
@@ -361,26 +394,18 @@ class LyricsIndicator extends PanelMenu.Button {
 
     _onSongChanged(data) {
         try {
+            // Check if this is a stop/empty event first
+            if (!data || Object.keys(data).length === 0) {
+                return;
+            }
+
             let artist = this._safeString(data['xesam:artist']).trim();
             let title = this._safeString(data['xesam:title']).trim();
             let album = this._safeString(data['xesam:album']).trim();
 
-            // Handle partial updates (missing metadata)
-            const hasKeys = Object.keys(data).length > 0;
-            const isMissingMetadata = (!title || !artist);
-
-            if (isMissingMetadata) {
-                if (hasKeys && this._currentSong) {
-                    // Partial update, ignore it
-                    return;
-                }
-                
-                // Player stopped
-                log('[Lyrics] Player stopped');
-                this._resetState();
-                this._currentSong = null;
-                this._label.set_text('♪ Idle');
-                this._updateHeader('No Song Playing', '...');
+            // Check if we have valid song data
+            if (!title || !artist) {
+                // Ignore partial updates
                 return;
             }
 
@@ -397,9 +422,15 @@ class LyricsIndicator extends PanelMenu.Button {
             this._updateHeader(title, artist);
             this._showSearchingIndicator();
             
-            // Fetch lyrics with slight delay to avoid rapid changes
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 750, () => {
+            // Clear previous timeout if exists
+            if (this._fetchTimeoutId) {
+                GLib.source_remove(this._fetchTimeoutId);
+            }
+
+            // Fetch lyrics with slight delay
+            this._fetchTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 750, () => {
                 this._executeFetch();
+                this._fetchTimeoutId = null;
                 return GLib.SOURCE_REMOVE;
             });
 
@@ -476,16 +507,29 @@ class LyricsIndicator extends PanelMenu.Button {
             const filepath = GLib.build_filenamev([lyricsDir, safeFilename]);
             const file = Gio.File.new_for_path(filepath);
 
+            // FIX: Explicitly convert string to GLib.Bytes
+            const byteArray = new TextEncoder().encode(json);
+            const bytes = new GLib.Bytes(byteArray);
+
+            // Use replace_contents_bytes_async (or standard async with bytes)
+            // Note: In some GJS versions replace_contents_async accepts bytes directly.
+            // Using replace_contents_async with GLib.Bytes is the standard safe way.
             file.replace_contents_async(
-                json,
+                bytes,
                 null,
                 false,
                 Gio.FileCreateFlags.NONE,
                 null,
-                null
+                (obj, res) => {
+                    try {
+                        obj.replace_contents_finish(res);
+                        log('[Lyrics] Saved to cache: ' + filepath);
+                    } catch (e) {
+                        logError(e, '[Lyrics] Failed to finish saving lyrics');
+                    }
+                }
             );
             
-            log('[Lyrics] Saved to cache: ' + filepath);
         } catch (e) {
             logError(e, '[Lyrics] Failed to save lyrics');
         }
@@ -501,7 +545,8 @@ class LyricsIndicator extends PanelMenu.Button {
             if (file.query_exists(null)) {
                 const [success, contents] = file.load_contents(null);
                 if (success) {
-                    this._parseLyrics(contents.toString());
+                    const text = new TextDecoder().decode(contents);
+                    this._parseLyrics(text);
                     return true;
                 }
             }
@@ -600,7 +645,7 @@ class LyricsIndicator extends PanelMenu.Button {
     }
 
     _updateCurrentLine() {
-        if (!this._currentPlayer || this._currentLyrics.length === 0) return;
+        if (!this._currentPlayer || this._currentLyrics.length === 0 || this._playbackStatus !== 'Playing') return;
 
         this._dbusConnection.call(
             this._currentPlayer,
@@ -782,6 +827,11 @@ class LyricsIndicator extends PanelMenu.Button {
         if (this._updateInterval) {
             GLib.source_remove(this._updateInterval);
             this._updateInterval = null;
+        }
+
+        if (this._fetchTimeoutId) {
+            GLib.source_remove(this._fetchTimeoutId);
+            this._fetchTimeoutId = null;
         }
         
         if (this._dbusSignalId && this._dbusConnection) {
