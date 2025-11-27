@@ -35,6 +35,7 @@ class LyricsIndicator extends PanelMenu.Button {
         this._fetchTimeoutId = null;
         this._dbusSignalId = null;
         this._playbackStatus = 'Stopped';
+        this._isSynced = false; // Track if we have timestamps
 
         // HTTP session
         this._session = new Soup.Session();
@@ -194,6 +195,7 @@ class LyricsIndicator extends PanelMenu.Button {
         this._currentLyrics = [];
         this._lyricActors = [];
         this._activeLineIndex = -1;
+        this._isSynced = false;
         this._lyricsBox.destroy_all_children();
     }
 
@@ -219,7 +221,6 @@ class LyricsIndicator extends PanelMenu.Button {
 
     _safeString(val) {
         if (val === null || val === undefined) return "";
-        // If it's a Variant, unpack it
         if (val.deep_unpack) return this._safeString(val.deep_unpack());
         if (typeof val === 'string') return val;
         if (Array.isArray(val)) return val.length > 0 ? this._safeString(val[0]) : "";
@@ -314,7 +315,6 @@ class LyricsIndicator extends PanelMenu.Button {
             }
         );
         
-        // Use GetAll to fetch everything atomically on connection
         this._refreshPlayerState();
     }
 
@@ -322,19 +322,13 @@ class LyricsIndicator extends PanelMenu.Button {
         const changedDict = params.get_child_value(1);
         const changed = changedDict.deep_unpack();
         
-        // Update playback status if changed
         if ('PlaybackStatus' in changed) {
             let status = changed['PlaybackStatus'];
-            
-            // Explicitly unpack if it's still a Variant
-            if (status && status.deep_unpack) {
-                status = status.deep_unpack();
-            }
+            if (status && status.deep_unpack) status = status.deep_unpack();
             
             this._playbackStatus = status;
             log(`[Lyrics] Playback status changed: ${this._playbackStatus}`);
             
-            // If stopped, clear current song
             if (this._playbackStatus === 'Stopped') {
                 this._resetState();
                 this._currentSong = null;
@@ -344,13 +338,9 @@ class LyricsIndicator extends PanelMenu.Button {
             }
         }
         
-        // Handle metadata changes
         if ('Metadata' in changed) {
             let meta = changed['Metadata'];
-            // Unpack metadata if needed
-            if (meta && meta.deep_unpack) {
-                meta = meta.deep_unpack();
-            }
+            if (meta && meta.deep_unpack) meta = meta.deep_unpack();
             this._onSongChanged(meta);
         }
     }
@@ -394,22 +384,14 @@ class LyricsIndicator extends PanelMenu.Button {
 
     _onSongChanged(data) {
         try {
-            // Check if this is a stop/empty event first
-            if (!data || Object.keys(data).length === 0) {
-                return;
-            }
+            if (!data || Object.keys(data).length === 0) return;
 
             let artist = this._safeString(data['xesam:artist']).trim();
             let title = this._safeString(data['xesam:title']).trim();
             let album = this._safeString(data['xesam:album']).trim();
 
-            // Check if we have valid song data
-            if (!title || !artist) {
-                // Ignore partial updates
-                return;
-            }
+            if (!title || !artist) return;
 
-            // Check if song actually changed
             if (this._currentSong && 
                 this._currentSong.title === title && 
                 this._currentSong.artist === artist) {
@@ -422,12 +404,10 @@ class LyricsIndicator extends PanelMenu.Button {
             this._updateHeader(title, artist);
             this._showSearchingIndicator();
             
-            // Clear previous timeout if exists
             if (this._fetchTimeoutId) {
                 GLib.source_remove(this._fetchTimeoutId);
             }
 
-            // Fetch lyrics with slight delay
             this._fetchTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 750, () => {
                 this._executeFetch();
                 this._fetchTimeoutId = null;
@@ -463,13 +443,11 @@ class LyricsIndicator extends PanelMenu.Button {
 
         const { artist, title, album } = this._currentSong;
 
-        // Try loading from cache first
         if (this._loadLyricsFromFile(artist, title)) {
             log('[Lyrics] Loaded from cache');
             return;
         }
 
-        // Fetch from API
         const url = `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}&album_name=${encodeURIComponent(album)}`;
         const message = Soup.Message.new('GET', url);
         message.request_headers.append('User-Agent', 'GNOME-Lyrics-Extension/1.0');
@@ -491,8 +469,6 @@ class LyricsIndicator extends PanelMenu.Button {
         });
     }
 
-    // --- FILE OPERATIONS ---
-
     _saveLyricsToFile(artist, title, json) {
         try {
             const homeDir = GLib.get_home_dir();
@@ -507,13 +483,9 @@ class LyricsIndicator extends PanelMenu.Button {
             const filepath = GLib.build_filenamev([lyricsDir, safeFilename]);
             const file = Gio.File.new_for_path(filepath);
 
-            // FIX: Explicitly convert string to GLib.Bytes
             const byteArray = new TextEncoder().encode(json);
             const bytes = new GLib.Bytes(byteArray);
 
-            // Use replace_contents_bytes_async (or standard async with bytes)
-            // Note: In some GJS versions replace_contents_async accepts bytes directly.
-            // Using replace_contents_async with GLib.Bytes is the standard safe way.
             file.replace_contents_async(
                 bytes,
                 null,
@@ -529,7 +501,6 @@ class LyricsIndicator extends PanelMenu.Button {
                     }
                 }
             );
-            
         } catch (e) {
             logError(e, '[Lyrics] Failed to save lyrics');
         }
@@ -551,49 +522,64 @@ class LyricsIndicator extends PanelMenu.Button {
                 }
             }
         } catch (e) {
-            // File doesn't exist or couldn't be read
         }
         return false;
     }
 
-    // --- PARSING & UI ---
+    // --- PARSING & UI (FIXED) ---
 
     _parseLyrics(json) {
         try {
             const data = JSON.parse(json);
-            const text = data.syncedLyrics || data.plainLyrics;
-
-            if (!text) {
-                this._showNoLyricsFound();
-                return;
-            }
-
+            
             this._resetState();
             this._currentLyrics = [];
-            const lines = text.split('\n');
-
-            for (const line of lines) {
-                const match = line.match(/\[(\d+):(\d+)(?:\.(\d+))?\](.*)/);
-                if (match) {
-                    const minutes = parseInt(match[1]);
-                    const seconds = parseInt(match[2]);
-                    const ms = match[3] ? parseInt(match[3].padEnd(3, '0').substring(0, 3)) : 0;
-                    const lyricText = match[4].trim();
-                    
-                    if (lyricText) {
+            
+            // 1. Try Synced Lyrics First
+            if (data.syncedLyrics) {
+                this._isSynced = true;
+                const lines = data.syncedLyrics.split('\n');
+                for (const line of lines) {
+                    const match = line.match(/\[(\d+):(\d+)(?:\.(\d+))?\](.*)/);
+                    if (match) {
+                        const minutes = parseInt(match[1]);
+                        const seconds = parseInt(match[2]);
+                        const ms = match[3] ? parseInt(match[3].padEnd(3, '0').substring(0, 3)) : 0;
+                        const lyricText = match[4].trim();
+                        
+                        if (lyricText) {
+                            this._currentLyrics.push({
+                                time: (minutes * 60 + seconds) * 1000 + ms,
+                                text: lyricText
+                            });
+                        }
+                    }
+                }
+                this._currentLyrics.sort((a, b) => a.time - b.time);
+            }
+            
+            // 2. Fallback to Plain Lyrics if Synced failed or didn't exist
+            if (this._currentLyrics.length === 0 && data.plainLyrics) {
+                this._isSynced = false;
+                const lines = data.plainLyrics.split('\n');
+                for (const line of lines) {
+                    const cleanLine = line.trim();
+                    if (cleanLine) {
                         this._currentLyrics.push({
-                            time: (minutes * 60 + seconds) * 1000 + ms,
-                            text: lyricText
+                            time: -1, // No time
+                            text: cleanLine
                         });
                     }
                 }
             }
 
-            this._currentLyrics.sort((a, b) => a.time - b.time);
-
             if (this._currentLyrics.length > 0) {
                 this._label.set_text('♪ Ready');
-                this._populateLyricsList();
+                // Use idle_add to ensure UI updates on the main thread
+                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    this._populateLyricsList();
+                    return GLib.SOURCE_REMOVE;
+                });
             } else {
                 this._showNoLyricsFound();
             }
@@ -607,6 +593,17 @@ class LyricsIndicator extends PanelMenu.Button {
     _populateLyricsList() {
         this._lyricActors = [];
         this._lyricsBox.destroy_all_children();
+
+        // If not synced, show a small indicator
+        if (!this._isSynced) {
+            const note = new St.Label({
+                text: '(Plain Lyrics - No Auto Scroll)',
+                style: 'font-size: 8pt; color: #888; text-align: center; padding-bottom: 10px;',
+                x_align: Clutter.ActorAlign.CENTER,
+                x_expand: true
+            });
+            this._lyricsBox.add_child(note);
+        }
 
         for (const line of this._currentLyrics) {
             const label = new St.Label({
@@ -622,30 +619,35 @@ class LyricsIndicator extends PanelMenu.Button {
     }
 
     _showNoLyricsFound() {
-        this._resetState();
-        this._label.set_text('♪ No Lyrics');
-        
-        const errorLabel = new St.Label({
-            text: '❌ No lyrics found for this song',
-            style: 'font-style: italic; color: #ff6b6b; text-align: center; padding: 20px;',
-            x_align: Clutter.ActorAlign.CENTER,
-            x_expand: true
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._resetState();
+            this._label.set_text('♪ No Lyrics');
+            
+            const errorLabel = new St.Label({
+                text: '❌ No lyrics found for this song',
+                style: 'font-style: italic; color: #ff6b6b; text-align: center; padding: 20px;',
+                x_align: Clutter.ActorAlign.CENTER,
+                x_expand: true
+            });
+            this._lyricsBox.add_child(errorLabel);
+            
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const timeLabel = new St.Label({
+                text: `Searched at ${timeStr}`,
+                style: 'font-size: 9pt; color: #666; text-align: center; padding: 8px;',
+                x_align: Clutter.ActorAlign.CENTER,
+                x_expand: true
+            });
+            this._lyricsBox.add_child(timeLabel);
+            return GLib.SOURCE_REMOVE;
         });
-        this._lyricsBox.add_child(errorLabel);
-        
-        const now = new Date();
-        const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        const timeLabel = new St.Label({
-            text: `Searched at ${timeStr}`,
-            style: 'font-size: 9pt; color: #666; text-align: center; padding: 8px;',
-            x_align: Clutter.ActorAlign.CENTER,
-            x_expand: true
-        });
-        this._lyricsBox.add_child(timeLabel);
     }
 
     _updateCurrentLine() {
-        if (!this._currentPlayer || this._currentLyrics.length === 0 || this._playbackStatus !== 'Playing') return;
+        // Only attempt to scroll if we have synced lyrics
+        if (!this._currentPlayer || this._currentLyrics.length === 0 || 
+            this._playbackStatus !== 'Playing' || !this._isSynced) return;
 
         this._dbusConnection.call(
             this._currentPlayer,
@@ -664,14 +666,13 @@ class LyricsIndicator extends PanelMenu.Button {
                     const positionMs = positionUs / 1000;
                     this._syncUI(positionMs);
                 } catch (e) {
-                    // Player might be closed
                 }
             }
         );
     }
 
     _syncUI(positionMs) {
-        if (this._currentLyrics.length === 0) return;
+        if (this._currentLyrics.length === 0 || !this._isSynced) return;
 
         let newIndex = -1;
         for (let i = 0; i < this._currentLyrics.length; i++) {
