@@ -75,7 +75,12 @@ sudo pacman -S zenity
     ```bash
     gnome-extensions enable lyrics@topbar.extension
     ```
-
+    
+6. **Debug it!**
+   Run the command:
+   ```bash
+   journalctl -f -o cat | grep -i lyrics
+   ```
 ---
 
 ## ⚙️ Configuration
